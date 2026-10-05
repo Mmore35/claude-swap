@@ -18,6 +18,13 @@ OAUTH_BETA_HEADER = "oauth-2025-04-20"
 OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000
 OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+# How long a refresh POST waits for its reply unless the caller passes a
+# tighter budget. The grant is single-use, so a request that reached the server
+# cannot be taken back: giving up on a slow reply discards the only copy of the
+# successor while the server retires the token we still hold, and the slot then
+# needs a fresh /login. Waiting is the cheap side of that trade. 30 s is what
+# Claude Code gives the same request (`timeout:30000` in 2.1.290).
+OAUTH_REFRESH_TIMEOUT_S = 30.0
 
 _logger = logging.getLogger("claude-swap")
 
@@ -143,7 +150,7 @@ class RefreshOutcome:
 
 
 def try_refresh_oauth_credentials(
-    credentials: str, timeout_s: float = 10.0
+    credentials: str, timeout_s: float = OAUTH_REFRESH_TIMEOUT_S
 ) -> RefreshOutcome:
     """Refresh an OAuth access token via direct token endpoint POST.
 
@@ -224,7 +231,21 @@ def try_refresh_oauth_credentials(
                 return RefreshOutcome(None, err)
         return RefreshOutcome(None, "transient")
     except Exception as e:
-        _logger.debug("OAuth refresh failed: %r", e)
+        # Still transient: a retry is the only move either way. But no reply is
+        # not proof that nothing was spent. A timeout or reset after the request
+        # went out leaves the grant's fate unknown, and if the server did rotate
+        # it, the next refresh of these same bytes gets invalid_grant. Record it
+        # at a level the default log keeps, so that later strike can be traced
+        # back to this exchange. This function is not told which account it
+        # serves, so the line carries the head of the credential fingerprint:
+        # the value the usage store writes as ``struckFingerprint``.
+        _logger.warning(
+            "OAuth refresh for %s got no usable reply (%r). The refresh token "
+            "on disk may now be spent; if the next refresh fails with "
+            "invalid_grant, re-run `cswap --add-account` after logging in.",
+            (credential_fingerprint(credentials) or "unknown")[:19],
+            e,
+        )
         return RefreshOutcome(None, "transient")
 
 

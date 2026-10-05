@@ -518,6 +518,51 @@ class TestTryRefreshOAuthCredentials:
             outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
         assert outcome.error == "transient"
 
+    def test_no_reply_is_logged_with_the_generation(self, caplog):
+        """A refresh that got no reply may still have been consumed server-side,
+        so it must leave a trace the default log level keeps."""
+        import logging
+
+        creds = self._make_credentials()
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            side_effect=TimeoutError("timed out"),
+        ), caplog.at_level(logging.WARNING, logger="claude-swap"):
+            outcome = oauth.try_refresh_oauth_credentials(creds)
+
+        assert outcome.error == "transient"
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert oauth.credential_fingerprint(creds)[:19] in warnings[0].getMessage()
+
+    def test_rejected_grant_is_not_logged_as_no_reply(self, caplog):
+        import logging
+
+        err = self._http_error(400, b'{"error": "invalid_grant"}')
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", side_effect=err
+        ), caplog.at_level(logging.WARNING, logger="claude-swap"):
+            oauth.try_refresh_oauth_credentials(self._make_credentials())
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+    def test_waits_for_the_reply_unless_the_caller_bounds_it(self):
+        """The default budget is the unlocked one; a caller holding a contended
+        lock still gets exactly the budget it asked for."""
+        seen = []
+
+        def mock_urlopen(req, timeout=0):
+            seen.append(timeout)
+            raise urllib.error.URLError("down")
+
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen
+        ):
+            oauth.try_refresh_oauth_credentials(self._make_credentials())
+            oauth.try_refresh_oauth_credentials(
+                self._make_credentials(), timeout_s=6.0
+            )
+        assert seen == [oauth.OAUTH_REFRESH_TIMEOUT_S, 6.0]
+
     def test_missing_refresh_token_is_permanent(self):
         creds = json.dumps({"claudeAiOauth": {"accessToken": "a", "expiresAt": 0}})
         outcome = oauth.try_refresh_oauth_credentials(creds)
