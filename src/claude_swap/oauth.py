@@ -230,20 +230,28 @@ def try_refresh_oauth_credentials(
             if err in ("invalid_grant", "invalid_client"):
                 return RefreshOutcome(None, err)
         return RefreshOutcome(None, "transient")
+    except urllib.error.URLError as e:
+        # The request did not go out whole: urllib wraps resolve, connect, TLS
+        # and send failures in URLError and leaves a failure while reading the
+        # reply unwrapped. No grant was spent, so this is the ordinary
+        # offline case and stays quiet.
+        _logger.debug("OAuth refresh not sent: %r", e)
+        return RefreshOutcome(None, "transient")
     except Exception as e:
-        # Still transient: a retry is the only move either way. But no reply is
-        # not proof that nothing was spent. A timeout or reset after the request
-        # went out leaves the grant's fate unknown, and if the server did rotate
-        # it, the next refresh of these same bytes gets invalid_grant. Record it
-        # at a level the default log keeps, so that later strike can be traced
-        # back to this exchange. This function is not told which account it
-        # serves, so the line carries the head of the credential fingerprint:
-        # the value the usage store writes as ``struckFingerprint``.
+        # Still transient: a retry is the only move either way. But the request
+        # went out, and no reply is not proof that nothing was spent. A timeout
+        # or reset while waiting leaves the grant's fate unknown, and if the
+        # server did rotate it, the next refresh of these same bytes gets
+        # invalid_grant. Record it at a level the default log keeps, so that
+        # later strike can be traced back to this exchange. This function is
+        # not told which account it serves, so the line carries the head of the
+        # credential fingerprint ("sha256:" and 12 hex digits): the value the
+        # usage store writes as ``struckFingerprint``.
         _logger.warning(
             "OAuth refresh for %s got no usable reply (%r). The refresh token "
             "on disk may now be spent; if the next refresh fails with "
             "invalid_grant, re-run `cswap --add-account` after logging in.",
-            (credential_fingerprint(credentials) or "unknown")[:19],
+            credential_fingerprint(credentials)[:19],
             e,
         )
         return RefreshOutcome(None, "transient")

@@ -533,21 +533,47 @@ class TestTryRefreshOAuthCredentials:
         assert outcome.error == "transient"
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1
+        # "sha256:" and 12 hex digits, as the store's struckFingerprint begins.
         assert oauth.credential_fingerprint(creds)[:19] in warnings[0].getMessage()
 
-    def test_rejected_grant_is_not_logged_as_no_reply(self, caplog):
+    def test_unsent_request_is_not_logged_as_no_reply(self, caplog):
+        """urllib wraps resolve, connect and send failures in URLError: the
+        request never reached the server, so no grant can have been spent."""
+        import logging
+        import socket
+
+        for cause in (
+            socket.gaierror(11001, "getaddrinfo failed"),
+            TimeoutError("timed out"),
+            ConnectionRefusedError(10061, "refused"),
+        ):
+            with patch(
+                "claude_swap.oauth.urllib.request.urlopen",
+                side_effect=urllib.error.URLError(cause),
+            ), caplog.at_level(logging.WARNING, logger="claude-swap"):
+                outcome = oauth.try_refresh_oauth_credentials(
+                    self._make_credentials()
+                )
+            assert outcome.error == "transient"
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+    def test_answered_refresh_is_not_logged_as_no_reply(self, caplog):
+        """A reply that carries an HTTP error is an answer, whatever it says."""
         import logging
 
-        err = self._http_error(400, b'{"error": "invalid_grant"}')
-        with patch(
-            "claude_swap.oauth.urllib.request.urlopen", side_effect=err
-        ), caplog.at_level(logging.WARNING, logger="claude-swap"):
-            oauth.try_refresh_oauth_credentials(self._make_credentials())
+        for err in (
+            self._http_error(400, b'{"error": "invalid_grant"}'),
+            self._http_error(503, b"upstream unavailable"),
+        ):
+            with patch(
+                "claude_swap.oauth.urllib.request.urlopen", side_effect=err
+            ), caplog.at_level(logging.WARNING, logger="claude-swap"):
+                oauth.try_refresh_oauth_credentials(self._make_credentials())
         assert not [r for r in caplog.records if r.levelno == logging.WARNING]
 
     def test_waits_for_the_reply_unless_the_caller_bounds_it(self):
-        """The default budget is the unlocked one; a caller holding a contended
-        lock still gets exactly the budget it asked for."""
+        """The default budget reaches urlopen; a caller that passes its own, as
+        the active-account refresh does under the account lock, gets that."""
         seen = []
 
         def mock_urlopen(req, timeout=0):
