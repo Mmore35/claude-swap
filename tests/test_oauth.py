@@ -535,6 +535,47 @@ class TestTryRefreshOAuthCredentials:
         assert len(warnings) == 1
         # "sha256:" and 12 hex digits, as the store's struckFingerprint begins.
         assert oauth.credential_fingerprint(creds)[:19] in warnings[0].getMessage()
+        assert "TimeoutError" in warnings[0].getMessage()
+
+    def test_server_error_reply_is_logged_as_no_reply(self, caplog):
+        """A 5xx is no verdict on the grant: a gateway can report an error for
+        a request the origin already acted on."""
+        import logging
+
+        for code in (502, 503, 504):
+            caplog.clear()
+            with patch(
+                "claude_swap.oauth.urllib.request.urlopen",
+                side_effect=self._http_error(code, b"upstream error"),
+            ), caplog.at_level(logging.WARNING, logger="claude-swap"):
+                outcome = oauth.try_refresh_oauth_credentials(
+                    self._make_credentials()
+                )
+            assert outcome.error == "transient"
+            warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+            assert len(warnings) == 1
+            assert f"HTTP {code}" in warnings[0].getMessage()
+
+    def test_unreadable_reply_keeps_its_bytes_out_of_the_warning(self, caplog):
+        """A decode error's repr is the reply body, and a reply body can hold
+        tokens: the warning names the exception type and nothing more."""
+        import logging
+
+        mock_response = MagicMock()
+        mock_response.read.return_value = b'\xff{"refresh_token": "leak-me"}'
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", return_value=mock_response
+        ), caplog.at_level(logging.WARNING, logger="claude-swap"):
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+
+        assert outcome.error == "transient"
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "UnicodeDecodeError" in warnings[0].getMessage()
+        assert "leak-me" not in warnings[0].getMessage()
 
     def test_unsent_request_is_not_logged_as_no_reply(self, caplog):
         """urllib wraps resolve, connect and send failures in URLError: the
@@ -558,12 +599,13 @@ class TestTryRefreshOAuthCredentials:
         assert not [r for r in caplog.records if r.levelno == logging.WARNING]
 
     def test_answered_refresh_is_not_logged_as_no_reply(self, caplog):
-        """A reply that carries an HTTP error is an answer, whatever it says."""
+        """A 4xx is the server's answer to the request, whatever it says."""
         import logging
 
         for err in (
             self._http_error(400, b'{"error": "invalid_grant"}'),
-            self._http_error(503, b"upstream unavailable"),
+            self._http_error(400, b'{"error": "temporarily_unavailable"}'),
+            self._http_error(429, b"slow down"),
         ):
             with patch(
                 "claude_swap.oauth.urllib.request.urlopen", side_effect=err

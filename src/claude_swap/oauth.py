@@ -156,7 +156,10 @@ def try_refresh_oauth_credentials(
 
     ``timeout_s`` bounds the network exchange. Callers that hold locks other
     processes contend for should pass a budget comfortably inside the
-    contenders' acquire timeout (see ``_fetch_active_usage``).
+    contenders' acquire timeout (see ``_fetch_active_usage``). The consume
+    gate is the deliberate exception: it keeps the default under its own
+    lock, and a contender that gives up first defers (see
+    ``ClaudeAccountSwitcher.consume_backup_grant``).
     """
     # ``no_refresh_token`` is a PERMANENT verdict (it strikes at
     # AUTH_DEAD_STRIKES=1), so it demands a structurally complete OAuth dict
@@ -229,6 +232,10 @@ def try_refresh_oauth_credentials(
             # keeps its own kind and lands no strike.
             if err in ("invalid_grant", "invalid_client"):
                 return RefreshOutcome(None, err)
+        if e.code >= 500:
+            # Not a verdict on the grant either: a gateway can report an error
+            # for a request the origin already acted on.
+            _warn_grant_fate_unknown(credentials, f"HTTP {e.code}")
         return RefreshOutcome(None, "transient")
     except urllib.error.URLError as e:
         # The request did not go out whole: urllib wraps resolve, connect, TLS
@@ -238,23 +245,35 @@ def try_refresh_oauth_credentials(
         _logger.debug("OAuth refresh not sent: %r", e)
         return RefreshOutcome(None, "transient")
     except Exception as e:
-        # Still transient: a retry is the only move either way. But the request
-        # went out, and no reply is not proof that nothing was spent. A timeout
-        # or reset while waiting leaves the grant's fate unknown, and if the
-        # server did rotate it, the next refresh of these same bytes gets
-        # invalid_grant. Record it at a level the default log keeps, so that
-        # later strike can be traced back to this exchange. This function is
-        # not told which account it serves, so the line carries the head of the
-        # credential fingerprint ("sha256:" and 12 hex digits): the value the
-        # usage store writes as ``struckFingerprint``.
-        _logger.warning(
-            "OAuth refresh for %s got no usable reply (%r). The refresh token "
-            "on disk may now be spent; if the next refresh fails with "
-            "invalid_grant, re-run `cswap --add-account` after logging in.",
-            credential_fingerprint(credentials)[:19],
-            e,
-        )
+        # The request went out and no usable reply came back: a timeout or
+        # reset while waiting, or a reply that could not be read.
+        _logger.debug("OAuth refresh failed: %r", e)
+        _warn_grant_fate_unknown(credentials, type(e).__name__)
         return RefreshOutcome(None, "transient")
+
+
+def _warn_grant_fate_unknown(credentials: str, what: str) -> None:
+    """Log a refresh that went out and came back without a verdict on the grant.
+
+    The outcome stays ``transient``: a retry is the only move either way. But
+    a timeout, a reset or a server error is not proof that nothing was spent,
+    and if the server did rotate the grant, the next refresh of these same
+    bytes gets invalid_grant. WARNING is a level the default log keeps, so
+    that later strike can be traced back to this exchange.
+
+    This module is not told which account it serves, so the line carries the
+    head of the credential fingerprint ("sha256:" and 12 hex digits): the
+    value the usage store writes as ``struckFingerprint``. ``what`` is a
+    status or an exception type name, never a repr: a decode error's repr is
+    the reply body, and a reply body can hold tokens.
+    """
+    _logger.warning(
+        "OAuth refresh for %s got no usable reply (%s). The refresh token "
+        "on disk may now be spent; if the next refresh fails with "
+        "invalid_grant, re-run `cswap --add-account` after logging in.",
+        credential_fingerprint(credentials)[:19],
+        what,
+    )
 
 
 def _parse_token_account(resp_data: dict) -> dict | None:
